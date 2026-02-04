@@ -1,0 +1,173 @@
+---
+name: Task Assistant • Dispatch
+
+# yamllint disable rule:truthy
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Execution mode"
+        required: true
+        default: "self-test"
+        type: choice
+        options:
+          - self-test
+          - validate
+
+  issues:
+    types: [labeled]
+
+  schedule:
+    - cron: "0 3 * * *"
+
+permissions:
+  contents: write
+  issues: write
+  id-token: write
+
+jobs:
+  # ─────────────────────────────────────────────
+  # Resolve execution context (NO infra logic)
+  # ─────────────────────────────────────────────
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      target_repo:     ${{ steps.ctx.outputs.target_repo }}
+      telemetry_repo:  ${{ steps.ctx.outputs.telemetry_repo }}
+      mode:            ${{ steps.ctx.outputs.mode }}
+      issue_number:    ${{ steps.ctx.outputs.issue_number }}
+      event_type:      ${{ steps.ctx.outputs.event_type }}
+      correlation_id:  ${{ steps.ctx.outputs.correlation_id }}
+
+    steps:
+      - id: ctx
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # ─────────────────────────────────────────────
+          # Correlation (system-generated ONLY)
+          # ─────────────────────────────────────────────
+          CORRELATION_ID="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          TARGET_REPO="${GITHUB_REPOSITORY}"
+          MODE=""
+          ISSUE_NUMBER=""
+          EVENT_TYPE=""
+
+          case "${GITHUB_EVENT_NAME}" in
+            workflow_dispatch)
+              MODE="${{ inputs.mode }}"
+              ;;
+            issues)
+              MODE="enforce"
+              ISSUE_NUMBER="${{ github.event.issue.number }}"
+              EVENT_TYPE="${{ github.event.action }}"
+              ;;
+            schedule)
+              MODE="validate"
+              ;;
+            *)
+              echo "::error::Unsupported event: ${GITHUB_EVENT_NAME}"
+              exit 1
+              ;;
+          esac
+
+          echo "target_repo=$TARGET_REPO"       >> "$GITHUB_OUTPUT"
+          echo "mode=$MODE"                     >> "$GITHUB_OUTPUT"
+          echo "issue_number=$ISSUE_NUMBER"     >> "$GITHUB_OUTPUT"
+          echo "event_type=$EVENT_TYPE"         >> "$GITHUB_OUTPUT"
+          echo "correlation_id=$CORRELATION_ID" >> "$GITHUB_OUTPUT"
+
+  # ─────────────────────────────────────────────
+  # Preflight (authoritative infra resolution)
+  # ─────────────────────────────────────────────
+  preflight:
+    needs: resolve
+    # yamllint disable rule:line-length
+    uses: automated-assistant-systems/task-assistant/.github/workflows/engine-preflight.yml@main
+    # yamllint enable rule:line-length
+    with:
+      target_repo:    ${{ needs.resolve.outputs.target_repo }}
+      correlation_id: ${{ needs.resolve.outputs.correlation_id }}
+    secrets:
+      CODEX_APP_ID:      ${{ secrets.CODEX_APP_ID }}
+      CODEX_PRIVATE_KEY: ${{ secrets.CODEX_PRIVATE_KEY }}
+
+  # ─────────────────────────────────────────────
+  # Self-Test (core + dashboard)
+  # ─────────────────────────────────────────────
+  self_test_core:
+    if: needs.resolve.outputs.mode == 'self-test'
+    needs:
+      - resolve
+      - preflight
+    # yamllint disable rule:line-length
+    uses: automated-assistant-systems/task-assistant/.github/workflows/engine-self-test.yml@main
+    # yamllint enable rule:line-length
+    with:
+      target_repo:    ${{ needs.resolve.outputs.target_repo }}
+      telemetry_repo: ${{ needs.preflight.outputs.telemetry_repo }}
+      correlation_id: ${{ needs.resolve.outputs.correlation_id }}
+    secrets:
+      CODEX_APP_ID:      ${{ secrets.CODEX_APP_ID }}
+      CODEX_PRIVATE_KEY: ${{ secrets.CODEX_PRIVATE_KEY }}
+
+  self_test_dashboard:
+    if: needs.resolve.outputs.mode == 'self-test'
+    needs:
+      - resolve
+      - preflight
+      - self_test_core
+    # yamllint disable rule:line-length
+    uses: automated-assistant-systems/task-assistant/.github/workflows/engine-dashboard-self-test.yml@main
+    # yamllint enable rule:line-length
+    with:
+      target_repo:    ${{ needs.resolve.outputs.target_repo }}
+      telemetry_repo: ${{ needs.preflight.outputs.telemetry_repo }}
+      correlation_id: ${{ needs.resolve.outputs.correlation_id }}
+    secrets:
+      CODEX_APP_ID:      ${{ secrets.CODEX_APP_ID }}
+      CODEX_PRIVATE_KEY: ${{ secrets.CODEX_PRIVATE_KEY }}
+
+  # ─────────────────────────────────────────────
+  # Validate (nightly + manual)
+  # ─────────────────────────────────────────────
+  validate:
+    if: needs.resolve.outputs.mode == 'validate'
+    needs:
+      - resolve
+      - preflight
+    # yamllint disable rule:line-length
+    uses: automated-assistant-systems/task-assistant/.github/workflows/engine-validate.yml@main
+    # yamllint enable rule:line-length
+    with:
+      target_repo:    ${{ needs.resolve.outputs.target_repo }}
+      telemetry_repo: ${{ needs.preflight.outputs.telemetry_repo }}
+      correlation_id: ${{ needs.resolve.outputs.correlation_id }}
+    secrets:
+      CODEX_APP_ID:      ${{ secrets.CODEX_APP_ID }}
+      CODEX_PRIVATE_KEY: ${{ secrets.CODEX_PRIVATE_KEY }}
+
+  # ─────────────────────────────────────────────
+  # Enforce (ISSUE-ONLY)
+  # ─────────────────────────────────────────────
+  enforce:
+    if: >
+      needs.resolve.outputs.mode == 'enforce' &&
+      needs.resolve.outputs.issue_number != ''
+    needs:
+      - resolve
+      - preflight
+    # yamllint disable rule:line-length
+    uses: automated-assistant-systems/task-assistant/.github/workflows/engine-enforce.yml@main
+    # yamllint enable rule:line-length
+    with:
+      target_repo:    ${{ needs.resolve.outputs.target_repo }}
+      issue_number:   ${{ needs.resolve.outputs.issue_number }}
+      event_type:     ${{ needs.resolve.outputs.event_type }}
+      telemetry_repo: ${{ needs.preflight.outputs.telemetry_repo }}
+      correlation_id: ${{ needs.resolve.outputs.correlation_id }}
+    secrets:
+      CODEX_APP_ID:      ${{ secrets.CODEX_APP_ID }}
+      CODEX_PRIVATE_KEY: ${{ secrets.CODEX_PRIVATE_KEY }}
